@@ -83,21 +83,41 @@ class IgnoreRule:
         self.hidden = hidden
 
     def matches(self, rel_path: str, file_size: int) -> bool:
-        if self.hidden is not None and is_hidden(rel_path) == self.hidden:
-            return True
-        if self.pattern and fnmatch.fnmatch(rel_path, self.pattern):
-            return True
-        if self.glob_pattern and fnmatch.fnmatch(rel_path, self.glob_pattern):
-            return True
+        has_condition = False
+        if self.hidden is not None:
+            has_condition = True
+            if is_hidden(rel_path) != self.hidden:
+                return False
+        if self.pattern:
+            has_condition = True
+            if not fnmatch.fnmatch(rel_path, self.pattern):
+                return False
+        if self.glob_pattern:
+            has_condition = True
+            if not fnmatch.fnmatch(rel_path, self.glob_pattern):
+                return False
         if self.directory:
+            has_condition = True
             norm_dir = self.directory.replace("\\", "/").rstrip("/") + "/"
-            if rel_path.startswith(norm_dir):
-                return True
-        if self.min_size is not None and file_size >= 0 and file_size < self.min_size:
-            return True
-        if self.max_size is not None and file_size >= 0 and file_size > self.max_size:
-            return True
-        return False
+            if not rel_path.startswith(norm_dir):
+                return False
+        if self.min_size is not None:
+            has_condition = True
+            if file_size < 0 or file_size < self.min_size:
+                return False
+        if self.max_size is not None:
+            has_condition = True
+            if file_size < 0 or file_size > self.max_size:
+                return False
+        return has_condition
+
+    def is_directory_rule(self) -> bool:
+        return (self.directory is not None and
+                self.pattern is None and
+                self.glob_pattern is None and
+                self.min_size is None and
+                self.max_size is None and
+                self.hidden is None)
 
 
 def load_ignore_config(config_path: str) -> list:
@@ -115,7 +135,9 @@ def load_ignore_config(config_path: str) -> list:
         return rules
     for entry in entries:
         if isinstance(entry, str):
-            if entry.startswith(".") and "/" not in entry:
+            if entry.endswith("/") or entry.endswith("\\"):
+                rules.append(IgnoreRule(directory=entry))
+            elif entry.startswith(".") and "/" not in entry:
                 rules.append(IgnoreRule(glob_pattern="*" + entry))
             else:
                 rules.append(IgnoreRule(glob_pattern=entry))
@@ -138,10 +160,22 @@ def should_skip(rel_path: str, file_size: int, rules: list) -> bool:
     return False
 
 
+def _should_prune_dir(rel_dir: str, rules: list) -> bool:
+    for rule in rules:
+        if rule.is_directory_rule():
+            norm_dir = rule.directory.replace("\\", "/").rstrip("/") + "/"
+            if rel_dir == rule.directory.rstrip("/").rstrip("\\") or rel_dir.startswith(norm_dir):
+                return True
+    return False
+
+
 def scan_folder(root: str, rules: list, verify_mode: str, sample_threshold: int) -> dict:
     result = {}
     root_path = Path(root).resolve()
     for dirpath, dirnames, filenames in os.walk(root_path):
+        dirnames[:] = [d for d in dirnames
+                       if not _should_prune_dir(os.path.relpath(
+                           os.path.join(dirpath, d), root_path).replace("\\", "/"), rules)]
         for fname in filenames:
             full_path = os.path.join(dirpath, fname)
             rel_path = os.path.relpath(full_path, root_path).replace("\\", "/")
@@ -194,6 +228,7 @@ def save_cache(cache_path: str, left_snapshot: dict, right_snapshot: dict,
             "only_right_count": len(report["only_right"]),
             "different_count": len(report["different"]),
             "identical_count": len(report["identical"]),
+            "deleted_count": len(report.get("deleted", [])),
         },
     }
     os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
@@ -519,15 +554,34 @@ def generate_html(report: dict, left_root: str, right_root: str,
     only_right = report["only_right"]
     different = report["different"]
     identical = report["identical"]
+    deleted = report.get("deleted", [])
 
     left_count = len(only_left)
     right_count = len(only_right)
     diff_count = len(different)
     same_count = len(identical)
+    deleted_count = len(deleted)
+
+    delta_stats = {}
+    for cat in ["only_left", "only_right", "different", "identical", "deleted"]:
+        for item in report.get(cat, []):
+            d = item.get("delta")
+            if d:
+                delta_stats[d] = delta_stats.get(d, 0) + 1
 
     rsync_html = ""
     for cmd in rsync_commands:
         rsync_html += f'<pre class="rsync-cmd">{html_escape(cmd)}</pre>'
+
+    delta_html = ""
+    if delta_stats:
+        items = []
+        for d, count in sorted(delta_stats.items()):
+            label, css = DELTA_LABELS.get(d, (d, "badge-modified"))
+            if label:
+                items.append(f'<span class="badge {css}">{label}: {count}</span>')
+        if items:
+            delta_html = f'<div class="delta-summary" id="deltaSummary">增量变化：{" ".join(items)}</div>'
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -657,6 +711,8 @@ tr:hover {{ background: #f8f9fb; }}
     </div>
 </div>
 
+{delta_html}
+
 <div class="toolbar">
     <input type="text" class="search-box" id="searchInput" placeholder="过滤文件名..." oninput="filterTable()">
     <button class="btn" onclick="exportCSV()">导出CSV</button>
@@ -677,6 +733,7 @@ tr:hover {{ background: #f8f9fb; }}
     <button class="tab-btn" onclick="switchTab('tab-right')">仅在右边 ({right_count})</button>
     <button class="tab-btn" onclick="switchTab('tab-diff')">内容不同 ({diff_count})</button>
     <button class="tab-btn" onclick="switchTab('tab-same')">完全相同 ({same_count})</button>
+    <button class="tab-btn" onclick="switchTab('tab-deleted')">已删除 ({deleted_count})</button>
 </div>
 
 <div id="tab-left" class="tab-content active">
@@ -740,6 +797,19 @@ tr:hover {{ background: #f8f9fb; }}
             </tr>
         </thead>
         <tbody id="tbody-same"></tbody>
+    </table>
+</div>
+
+<div id="tab-deleted" class="tab-content">
+    <p style="padding: 0 0 12px 0; color: #888; font-size: 13px;">以下文件在上次快照中存在，但本次扫描中已从两侧消失。</p>
+    <table>
+        <thead>
+            <tr>
+                <th style="width:90px;">状态</th>
+                <th>文件路径</th>
+            </tr>
+        </thead>
+        <tbody id="tbody-deleted"></tbody>
     </table>
 </div>
 
@@ -925,10 +995,44 @@ function buildSameRows() {{
     document.getElementById("tbody-same").innerHTML = rows.join("");
 }}
 
+function buildDeletedRows() {{
+    var rows = [];
+    (REPORT.deleted || []).forEach(function(item) {{
+        rows.push(
+            '<tr>' +
+            '<td>' + deltaBadge(item.delta) + '</td>' +
+            '<td class="file-path">' + escHtml(item.path) + '</td>' +
+            '</tr>'
+        );
+    }});
+    document.getElementById("tbody-deleted").innerHTML = rows.join("");
+}}
+
+function buildDeltaSummary() {{
+    var stats = {{}};
+    ["only_left","only_right","different","identical","deleted"].forEach(function(cat) {{
+        (REPORT[cat] || []).forEach(function(item) {{
+            if (item.delta) stats[item.delta] = (stats[item.delta] || 0) + 1;
+        }});
+    }});
+    var container = document.getElementById("deltaSummary");
+    if (!container) return;
+    var html = "";
+    Object.keys(stats).sort().forEach(function(d) {{
+        var dl = DELTA_LABELS[d];
+        var label = dl ? dl[0] : d;
+        var css = dl ? dl[1] : "badge-modified";
+        if (label) html += '<span class="badge ' + css + '">' + label + ': ' + stats[d] + '</span> ';
+    }});
+    if (html) container.innerHTML = '增量变化：' + html;
+}}
+
+buildDeltaSummary();
 buildLeftRows();
 buildRightRows();
 buildDiffRows();
 buildSameRows();
+buildDeletedRows();
 
 function switchTab(tabId) {{
     document.querySelectorAll(".tab-btn").forEach(function(b) {{ b.classList.remove("active"); }});
@@ -1003,16 +1107,19 @@ function filterTable() {{
 function exportCSV() {{
     var csv = "\\uFEFF状态,文件路径,大小_左,大小_右,修改时间_左,修改时间_右,MD5_左,MD5_右,校验方式,错误\\n";
     REPORT.only_left.forEach(function(item) {{
-        csv += "仅在左边," + escapeCSV(item.path) + "," + escapeCSV(item.size) + ",,,," + escapeCSV(item.md5) + ",," + escapeCSV(item.verify_method) + "," + escapeCSV(item.error || "") + "\\n";
+        csv += "仅在左边," + escapeCSV(item.path) + "," + escapeCSV(item.size) + ",," + escapeCSV(item.mtime) + ",," + escapeCSV(item.md5) + ",," + escapeCSV(item.verify_method) + "," + escapeCSV(item.error || "") + "\\n";
     }});
     REPORT.only_right.forEach(function(item) {{
-        csv += "仅在右边," + escapeCSV(item.path) + ",,,," + escapeCSV(item.size) + ",," + escapeCSV(item.md5) + "," + escapeCSV(item.verify_method) + "," + escapeCSV(item.error || "") + "\\n";
+        csv += "仅在右边," + escapeCSV(item.path) + ",," + escapeCSV(item.size) + ",," + escapeCSV(item.mtime) + ",," + escapeCSV(item.md5) + "," + escapeCSV(item.verify_method) + "," + escapeCSV(item.error || "") + "\\n";
     }});
     REPORT.different.forEach(function(item) {{
         csv += "内容不同," + escapeCSV(item.path) + "," + escapeCSV(item.left_size) + "," + escapeCSV(item.right_size) + "," + escapeCSV(item.left_mtime) + "," + escapeCSV(item.right_mtime) + "," + escapeCSV(item.left_md5) + "," + escapeCSV(item.right_md5) + "," + escapeCSV(item.left_verify_method + "/" + item.right_verify_method) + "," + escapeCSV((item.left_error||"") + " | " + (item.right_error||"")) + "\\n";
     }});
     REPORT.identical.forEach(function(item) {{
         csv += "完全相同," + escapeCSV(item.path) + "," + escapeCSV(item.size) + "," + escapeCSV(item.size) + ",,,," + escapeCSV(item.md5) + "," + escapeCSV(item.md5) + "," + escapeCSV(item.verify_method) + ",\\n";
+    }});
+    (REPORT.deleted || []).forEach(function(item) {{
+        csv += "已删除," + escapeCSV(item.path) + ",,,,,,,,\\n";
     }});
     downloadBlob(csv, "folder_diff_report.csv", "text/csv;charset=utf-8;");
 }}
@@ -1044,7 +1151,7 @@ def export_csv(report: dict, csv_path: str) -> None:
                              item.get("md5", ""), "", item.get("verify_method", ""),
                              item.get("error", "")])
         for item in report["only_right"]:
-            writer.writerow(["仅在右边", item["path"], "", "", "", item.get("mtime", ""),
+            writer.writerow(["仅在右边", item["path"], "", item["size"], "", item.get("mtime", ""),
                              "", item.get("md5", ""), item.get("verify_method", ""),
                              item.get("error", "")])
         for item in report["different"]:
@@ -1057,6 +1164,9 @@ def export_csv(report: dict, csv_path: str) -> None:
             writer.writerow(["完全相同", item["path"], item["size"], item["size"], "", "",
                              item.get("md5", ""), item.get("md5", ""),
                              item.get("verify_method", ""), ""])
+        for item in report.get("deleted", []):
+            writer.writerow(["已删除", item["path"], "", "", "", "",
+                             "", "", "", ""])
 
 
 def export_json(report: dict, json_path: str) -> None:
@@ -1067,6 +1177,7 @@ def export_json(report: dict, json_path: str) -> None:
             "only_right": len(report["only_right"]),
             "different": len(report["different"]),
             "identical": len(report["identical"]),
+            "deleted": len(report.get("deleted", [])),
             "total_left": report["total_left"],
             "total_right": report["total_right"],
         },
@@ -1078,6 +1189,8 @@ def export_json(report: dict, json_path: str) -> None:
                        for item in report["different"]],
         "identical": [{k: v for k, v in item.items() if k != "diff"}
                        for item in report["identical"]],
+        "deleted": [{k: v for k, v in item.items() if k != "diff"}
+                     for item in report.get("deleted", [])],
     }
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, ensure_ascii=False, default=str)
@@ -1212,8 +1325,8 @@ def main():
         print(f"已保存缓存快照: {args.cache}")
 
     delta_stats = {}
-    for cat in ["only_left", "only_right", "different", "identical"]:
-        for item in report[cat]:
+    for cat in ["only_left", "only_right", "different", "identical", "deleted"]:
+        for item in report.get(cat, []):
             d = item.get("delta")
             if d:
                 delta_stats[d] = delta_stats.get(d, 0) + 1
@@ -1225,6 +1338,8 @@ def main():
     print(f"  仅在右边:  {len(report['only_right'])} 个文件")
     print(f"  内容不同:  {len(report['different'])} 个文件")
     print(f"  完全相同:  {len(report['identical'])} 个文件")
+    if report.get("deleted"):
+        print(f"  已删除:    {len(report['deleted'])} 个文件")
     if delta_stats:
         print("  --- 增量变化 ---")
         for d, count in sorted(delta_stats.items()):
